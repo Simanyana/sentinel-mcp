@@ -1,3 +1,5 @@
 mcp>=2,<3
-uvicorn
 boto3
+starlette
+uvicorn
+pytest
