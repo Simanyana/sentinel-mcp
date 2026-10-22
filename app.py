@@ -1,3 +1,5 @@
+from starlette.applications import Starlette
+from starlette.routing import Mount, Route
 import hmac
 import json
 import logging
@@ -10,7 +12,9 @@ from botocore.exceptions import BotoCoreError, ClientError
 from mcp.server.mcpserver import MCPServer
 from mcp.server.transport_security import TransportSecuritySettings
 from starlette.middleware.base import BaseHTTPMiddleware
-from starlette.responses import JSONResponse
+from starlette.requests import Request
+from starlette.responses import HTMLResponse, JSONResponse
+from starlette.routing import Route
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("sentinel")
@@ -397,6 +401,8 @@ class TokenAuth(BaseHTTPMiddleware):
     """Reject every request that does not carry the secret bearer token."""
 
     async def dispatch(self, request, call_next):
+        if request.url.path == "/chat" and request.method == "GET":
+            return await call_next(request)
         expected = os.environ.get("MCP_TOKEN", "")
         given = request.headers.get("authorization", "")
         wanted = "Bearer " + expected
@@ -405,9 +411,100 @@ class TokenAuth(BaseHTTPMiddleware):
         return await call_next(request)
 
 
-app = mcp.streamable_http_app(
+
+CHAT_PAGE = """<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Sentinel Ask</title>
+</head>
+<body>
+  <h1>Sentinel</h1>
+  <p>Ask about CloudTrail sign-ins, GuardDuty findings, or today security activity.</p>
+  <input id="question" placeholder="Any suspicious sign-ins today?">
+  <button onclick="askSentinel()">Ask</button>
+  <div id="answer">Enter a question to begin.</div>
+  <p>This is a local, evidence-based briefing based on available records. It does not determine whether an account is safe or unsafe.</p>
+  <script>
+    async function askSentinel() {
+      const question = document.getElementById("question").value.trim();
+      const answerBox = document.getElementById("answer");
+      if (!question) { answerBox.textContent = "Please enter a question."; return; }
+      answerBox.textContent = "Checking evidence...";
+      try {
+        const response = await fetch("/ask", {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "Authorization": "Bearer " + localStorage.getItem("sentinel_token")
+          },
+          body: JSON.stringify({ question })
+        });
+        if (response.status === 401) {
+          const token = prompt("Enter your Sentinel token:");
+          if (token) {
+            localStorage.setItem("sentinel_token", token);
+            askSentinel();
+          } else {
+            answerBox.textContent = "A valid Sentinel token is required.";
+          }
+          return;
+        }
+        if (!response.ok) { throw new Error("Request failed"); }
+        const data = await response.json();
+        answerBox.textContent = data.answer;
+      } catch (error) {
+        answerBox.textContent = "Sentinel could not complete this request. Please try again.";
+      }
+    }
+  </script>
+</body>
+</html>"""
+
+
+async def chat_page(request: Request):
+    return HTMLResponse(CHAT_PAGE, headers={"X-Sentinel-Version": "chat-wrapper-2"})
+
+
+async def ask_sentinel(request: Request):
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"answer": "Invalid request."}, status_code=400)
+
+    question = str(body.get("question", "")).lower().strip()
+
+    if not question:
+        answer = "Please enter a question about sign-ins, GuardDuty findings, or today security activity."
+    else:
+        try:
+            if "suspicious sign-in" in question or "sign-in" in question or "signin" in question:
+                result = recent_signins(hours=24, max_results=20)
+                answer = "CloudTrail sign-in briefing:\n\n" + json.dumps(result, indent=2, default=str)
+            elif "guardduty" in question or "finding" in question:
+                result = security_findings(min_severity=0, max_results=10)
+                answer = "GuardDuty findings briefing:\n\n" + json.dumps(result, indent=2, default=str)
+            elif "security" in question or "briefing" in question or "today" in question:
+                result = security_briefing(hours=24)
+                answer = result["briefing"]
+            else:
+                answer = "I can answer questions about CloudTrail sign-ins, GuardDuty findings, or today security activity."
+        except Exception:
+            logger.exception("Sentinel ask route failed")
+            answer = "Sentinel could not retrieve or explain the evidence at this time. Please try again later."
+
+    answer += "\n\nThis is a local, evidence-based briefing based on available records. It does not determine whether an account is safe or unsafe."
+    return JSONResponse({"answer": answer})
+
+mcp_app = mcp.streamable_http_app(
     stateless_http=True,
     json_response=True,
     transport_security=TransportSecuritySettings(enable_dns_rebinding_protection=False),
 )
-app.add_middleware(TokenAuth)
+main_app = Starlette(routes=[
+    Route("/chat", chat_page, methods=["GET"]),
+    Route("/ask", ask_sentinel, methods=["POST"]),
+    Mount("/", mcp_app),
+])
+main_app.add_middleware(TokenAuth)
+app = main_app
